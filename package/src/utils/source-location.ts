@@ -15,7 +15,7 @@ import * as React from "react";
 // - React 19.x (with fallbacks for changed internals)
 //
 // Limitations:
-// - Only works in development builds (production builds strip _debugSource)
+// - Generated bundle locations need source maps to resolve to original source
 // - Requires React DevTools-style fiber access
 // - Some bundlers may strip debug info even in development
 // =============================================================================
@@ -481,13 +481,40 @@ function getReactDispatcher(): {
 }
 
 /**
- * Parse the first non-internal frame from an error stack string.
+ * Locate the probed component, using its caller as a boundary when available.
  */
 function parseComponentFrame(
   stack: string,
   functionName?: string,
+  callerStack?: string,
 ): { fileName: string; line: number; column?: number } | null {
   const lines = stack.split("\n");
+
+  // V8 format: "    at FnName (file:line:col)" or "    at file:line:col"
+  const v8Re = /^\s*at\s+(?:.*?\s+\()?(.+?):(\d+):(\d+)\)?$/;
+  // WebKit/Gecko: "FnName@file:line:col" or "@file:line:col"
+  const webkitRe = /^[^@]*@(.+?):(\d+):(\d+)$/;
+
+  if (callerStack !== undefined) {
+    const callerFrame = callerStack.split("\n").find(
+      (line) => v8Re.test(line) || webkitRe.test(line)
+    );
+    if (!callerFrame) return null;
+    const callerIndex = lines.findIndex(
+      (line) => line.trim() === callerFrame.trim()
+    );
+    if (callerIndex < 1) return null;
+
+    // The preceding frame is the component, even when hooks and Agentation
+    // share a minified bundle and component names are unavailable.
+    const componentFrame = lines[callerIndex - 1].trim();
+    const match = v8Re.exec(componentFrame) || webkitRe.exec(componentFrame);
+    return match ? {
+      fileName: match[1],
+      line: parseInt(match[2], 10),
+      column: parseInt(match[3], 10),
+    } : null;
+  }
 
   // Patterns to skip: our own bundle, React internals, node_modules, chunk files
   const skipPatterns = [
@@ -507,11 +534,6 @@ function parseComponentFrame(
     /scheduler/,
     /<anonymous>/,           // Proxy handler frames
   ];
-
-  // V8 format: "    at FnName (file:line:col)" or "    at file:line:col"
-  const v8Re = /^\s*at\s+(?:.*?\s+\()?(.+?):(\d+):(\d+)\)?$/;
-  // WebKit/Gecko: "FnName@file:line:col" or "@file:line:col"
-  const webkitRe = /^[^@]*@(.+?):(\d+):(\d+)$/;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -599,6 +621,7 @@ function probeComponentSource(fiber: ReactFiber): SourceLocation | null {
 
   const original = dispatcher.get();
   let result: SourceLocation | null = null;
+  let callerStack: string | undefined;
 
   try {
     // Install a proxy dispatcher that throws an Error (with stack) on any hook access.
@@ -608,7 +631,14 @@ function probeComponentSource(fiber: ReactFiber): SourceLocation | null {
       {},
       {
         get() {
-          throw new Error("probe");
+          const error = new Error("probe");
+          if (typeof Error.captureStackTrace === "function") {
+            const caller = new Error();
+            // Function identity survives minification; filenames and names do not.
+            Error.captureStackTrace(caller, fn);
+            callerStack = caller.stack;
+          }
+          throw error;
         },
       }
     );
@@ -621,7 +651,10 @@ function probeComponentSource(fiber: ReactFiber): SourceLocation | null {
       fn({});
     } catch (e) {
       if (e instanceof Error && e.message === "probe" && e.stack) {
-        const frame = parseComponentFrame(e.stack, fn.name);
+        // Without a function boundary or a name, an internal frame is ambiguous.
+        const frame = callerStack !== undefined || fn.name
+          ? parseComponentFrame(e.stack, fn.name, callerStack)
+          : null;
         if (frame) {
           const cleaned = cleanSourcePath(frame.fileName);
           result = {
@@ -667,8 +700,8 @@ function probeSourceWalk(
  * Gets the source file location for a DOM element in a React application
  *
  * This function attempts to extract the source file path and line number
- * where a React component is defined. This only works in development mode
- * as production builds strip debug information.
+ * where a React component is defined. Development metadata provides original
+ * locations; stack probes may return generated locations that need source maps.
  *
  * @param element - DOM element to get source location for
  * @returns SourceLocationResult with location info or reason for failure
