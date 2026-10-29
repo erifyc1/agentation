@@ -386,8 +386,12 @@ function findDebugSourceReact19(
 // stack frames already contain original source paths.
 // =============================================================================
 
+interface ProbedSourceLocation extends SourceLocation {
+  stackFileName: string;
+}
+
 /** Cache: component function → probed SourceLocation (or null if unresolvable) */
-const sourceProbeCache = new Map<Function, SourceLocation | null>();
+const sourceProbeCache = new Map<Function, ProbedSourceLocation | null>();
 
 /**
  * Extract the callable function from a fiber, handling wrappers.
@@ -604,7 +608,7 @@ function cleanSourcePath(rawPath: string): string {
  * Probe a single fiber's component function by invoking it with a
  * throwing hooks dispatcher and parsing the resulting error stack.
  */
-function probeComponentSource(fiber: ReactFiber): SourceLocation | null {
+function probeComponentSource(fiber: ReactFiber): ProbedSourceLocation | null {
   const fn = unwrapComponentType(fiber);
   if (!fn) return null;
 
@@ -620,7 +624,7 @@ function probeComponentSource(fiber: ReactFiber): SourceLocation | null {
   }
 
   const original = dispatcher.get();
-  let result: SourceLocation | null = null;
+  let result: ProbedSourceLocation | null = null;
   let callerStack: string | undefined;
 
   try {
@@ -648,7 +652,7 @@ function probeComponentSource(fiber: ReactFiber): SourceLocation | null {
       // Invoke the component — it will either:
       // 1. Call a hook → throws Error with stack (ideal case)
       // 2. Have no hooks → runs to completion (harmless, discarded), no stack to parse
-      fn({});
+      fn(fiber.memoizedProps || {}, null);
     } catch (e) {
       if (e instanceof Error && e.message === "probe" && e.stack) {
         // Without a function boundary or a name, an internal frame is ambiguous.
@@ -659,6 +663,7 @@ function probeComponentSource(fiber: ReactFiber): SourceLocation | null {
           const cleaned = cleanSourcePath(frame.fileName);
           result = {
             fileName: cleaned,
+            stackFileName: frame.fileName.replace(/[?#].*$/, ""),
             lineNumber: frame.line,
             columnNumber: frame.column,
             componentName: getComponentName(fiber) || undefined,
@@ -672,6 +677,58 @@ function probeComponentSource(fiber: ReactFiber): SourceLocation | null {
 
   sourceProbeCache.set(fn, result);
   return result;
+}
+
+/** Read only this fiber's metadata so an ancestor's location is never assigned to it. */
+function getOwnDebugSource(fiber: ReactFiber): SourceLocation | null {
+  const record = fiber as unknown as Record<string, unknown>;
+  const candidates = [
+    record._debugSource,
+    record.__source,
+    record._source,
+    record.debugSource,
+    fiber.memoizedProps?.__source,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const source = candidate as Record<string, unknown>;
+    if (typeof source.fileName === "string" && typeof source.lineNumber === "number") {
+      return {
+        fileName: source.fileName,
+        lineNumber: source.lineNumber,
+        columnNumber: typeof source.columnNumber === "number" ? source.columnNumber : undefined,
+      };
+    }
+  }
+  return null;
+}
+
+/** Capture React ancestry for an element, with source coordinates for each component. */
+export function getReactComponentStack(element: HTMLElement): string | undefined {
+  let fiber = getFiberFromElement(element);
+  const frames: string[] = [];
+  let depth = 0;
+
+  while (fiber && depth < 50) {
+    const fn = unwrapComponentType(fiber);
+    const type = fiber.type;
+    if (fn || typeof type === "function" || (type && typeof type === "object" && "render" in type)) {
+      const name = getComponentName(fiber) || fn?.name || "Anonymous";
+      const source = getOwnDebugSource(fiber) || probeComponentSource(fiber);
+      const fileName = source && "stackFileName" in source && typeof source.stackFileName === "string"
+        ? source.stackFileName
+        : source?.fileName;
+      const location = source && fileName
+        ? formatSourceLocation({ ...source, fileName })
+        : "source unavailable";
+      frames.push(`    at ${name} (${location})`);
+    }
+    fiber = fiber.return ?? null;
+    depth++;
+  }
+
+  if (fiber) frames.push("    ... ancestry truncated after 50 fibers");
+  return frames.length ? frames.join("\n") : undefined;
 }
 
 /**

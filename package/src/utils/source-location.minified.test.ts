@@ -3,13 +3,13 @@ import { SourceMap } from "node:module";
 import { resolve } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { SourceLocationResult } from "./source-location";
+import { getReactComponentStack as getLocalReactComponentStack, type SourceLocationResult } from "./source-location";
 
 const fixtureSource = `
 import * as React from "react";
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
-import { getSourceLocation } from "./source-location";
+import { getReactComponentStack, getSourceLocation } from "./source-location";
 
 function useFixtureState() { return React.useState(0); }
 function DirectComponent() {
@@ -20,21 +20,31 @@ function CustomHookComponent() {
   const [count, setCount] = useFixtureState();
   return React.createElement("button", { onClick: () => setCount(count + 1) }, "Count " + count);
 }
-export function mount(container, customHook, anonymous) {
+function ParentComponent({ Child, value }) {
+  if (!value.length) throw new Error("missing props");
+  const [ready] = React.useState(true);
+  if (!ready) return null;
+  return React.createElement(Child);
+}
+export function mount(container, customHook, anonymous, withParent) {
   const Component = customHook ? CustomHookComponent : DirectComponent;
   if (anonymous) Object.defineProperty(Component, "name", { value: "" });
   const root = createRoot(container);
-  flushSync(() => root.render(React.createElement(Component)));
+  const element = withParent
+    ? React.createElement(ParentComponent, { Child: Component, value: "ready" })
+    : React.createElement(Component);
+  flushSync(() => root.render(element));
   return () => flushSync(() => root.unmount());
 }
 export function click(button) { flushSync(() => button.click()); }
-export { getSourceLocation };
+export { getReactComponentStack, getSourceLocation };
 `;
 
 interface ProbeFixture {
-  mount(container: HTMLElement, customHook: boolean, anonymous: boolean): () => void;
+  mount(container: HTMLElement, customHook: boolean, anonymous: boolean, withParent: boolean): () => void;
   click(button: HTMLButtonElement): void;
   getSourceLocation(element: HTMLElement): SourceLocationResult;
+  getReactComponentStack(element: HTMLElement): string | undefined;
 }
 
 let bundle: string;
@@ -81,7 +91,7 @@ afterEach(() => {
 
 function mountFixture(
   path: string,
-  { customHook = true, anonymous = false, stackSetup = "" } = {}
+  { customHook = true, anonymous = false, withParent = false, stackSetup = "" } = {}
 ) {
   const context = createContext({ window, document, navigator, console, setTimeout, clearTimeout });
   runInContext(stackSetup, context);
@@ -90,7 +100,7 @@ function mountFixture(
   }) as ProbeFixture;
   container = document.createElement("div");
   document.body.appendChild(container);
-  unmount = fixture.mount(container, customHook, anonymous);
+  unmount = fixture.mount(container, customHook, anonymous, withParent);
   const button = container.querySelector("button")!;
   return { fixture, button };
 }
@@ -109,6 +119,47 @@ function expectComponentSource(result: SourceLocationResult, hookCall: string) {
 }
 
 describe("source probing in a shared minified bundle", () => {
+  it("does not borrow an ancestor's development source for an unprobeable child", () => {
+    const element = document.createElement("span");
+    function Child() { return null; }
+    function Parent() { return null; }
+    const parent = {
+      tag: 0,
+      type: Parent,
+      _debugSource: { fileName: "src/Parent.tsx", lineNumber: 7 },
+      return: null,
+    };
+    const child = { tag: 0, type: Child, return: parent };
+    Object.defineProperty(element, "__reactFiber$test", {
+      value: { tag: 5, type: "span", return: child },
+      enumerable: true,
+    });
+    expect(getLocalReactComponentStack(element)).toBe(
+      "    at Child (source unavailable)\n    at Parent (src/Parent.tsx:7)"
+    );
+  });
+
+  it("captures each component's mapped frame in nearest-first order", () => {
+    const { fixture, button } = mountFixture("/static/js/async/123456.abcdef123456.js", { withParent: true });
+    const stack = fixture.getReactComponentStack(button);
+    expect(stack).toBeDefined();
+    const frames = stack!.split("\n");
+    const mappedLines = frames.flatMap((frame) => {
+      const location = /:(\d+):(\d+)\)$/.exec(frame);
+      if (!location) return [];
+      const mapped = sourceMap.findEntry(Number(location[1]) - 1, Number(location[2]) - 1);
+      return "originalSource" in mapped && mapped.originalSource?.endsWith("source-probe-fixture.tsx")
+        ? [mapped.originalLine]
+        : [];
+    });
+    const fixtureLines = fixtureSource.split("\n");
+    expect(mappedLines.slice(0, 2)).toEqual([
+      fixtureLines.findIndex((line) => line.includes("const [count, setCount] = useFixtureState();")),
+      fixtureLines.findIndex((line) => line.includes("const [ready] = React.useState(true);")),
+    ]);
+    expect(frames[0]).toContain("http://localhost/static/js/async/123456.abcdef123456.js");
+  });
+
   it.each([
     [false, "const [count, setCount] = React.useState(0);"],
     [true, "const [count, setCount] = useFixtureState();"],
